@@ -1,0 +1,19 @@
+// generator client {
+//   provider = "prisma-client-js"
+// }
+
+generator server {
+  provider = "cargo prisma"
+  output   = "../src/db.rs"
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  id              String @id @unique @default(uuid()) @db.NChar(36)
+  name            String @unique @db.NVarChar(64)
+  hashed_password String @unique @db.NVarChar(96)
+}
