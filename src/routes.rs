@@ -1,55 +1,94 @@
-use axum::{
-    http::{header, StatusCode, Uri},
-    response::{Html, IntoResponse, Response},
-    routing::Router,
+use std::{
+    env,
+    str::FromStr,
+    sync::{Arc, Mutex},
 };
-use rust_embed::RustEmbed;
 
-static INDEX_HTML: &str = "index.html";
+use axum::{
+    routing::{self, Router},
+    Extension,
+};
+use sqlx::mssql::{MssqlConnectOptions, MssqlPoolOptions};
 
-#[derive(Debug, RustEmbed)]
-#[folder = "out/"]
-struct Assets;
+use crate::{
+    controllers,
+    db::{user_type, PrismaClient},
+    models::auth::ADMIN_TYPE_ID_RAW,
+    utils::AppPrismaClient,
+};
 
-pub async fn run_server() {
-    let app = Router::new().fallback(spa_static_handler);
+fn create_admin_router() -> Router {
+    Router::new()
+        .route("/hello", routing::any(|| async { "hello world" }))
+        .route("/register", routing::post(controllers::auth::user_register))
+}
 
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+fn create_reader_router() -> Router {
+    Router::new()
+}
+
+fn create_api_router() -> Router {
+    Router::new()
+        .route("/hello", axum::routing::any(|| async { "hello world" }))
+        .nest("/admin", create_admin_router())
+        .nest("/reader", create_reader_router())
+}
+
+async fn init_server() {
+    let prisma_client = Arc::new(PrismaClient::_builder().build().await.unwrap());
+    let admin_type = prisma_client
+        .user_type()
+        .find_first(vec![user_type::name::equals("admin".to_string())])
+        .exec()
+        .await
+        .unwrap();
+
+    let admin_id = match admin_type {
+        Some(admin_type) => admin_type.id,
+        None => {
+            prisma_client
+                .user_type()
+                .create("admin".to_string(), vec![])
+                .exec()
+                .await
+                .unwrap()
+                .id
+        }
+    };
+    ADMIN_TYPE_ID_RAW
+        .set(Mutex::new(admin_id))
+        .expect("Failed to initialize default user type.");
+}
+
+pub async fn run_server(bind: &str) {
+    init_server().await;
+
+    let pool = Arc::new(
+        MssqlPoolOptions::new()
+            .connect_with(
+                MssqlConnectOptions::from_str(
+                    &env::var("DATABASE_URL").expect("env DATABASE_URL not defined"),
+                )
+                .expect("Failed to parse DATABASE_URL"),
+            )
+            .await
+            .expect("Failed to connect to DB"),
+    );
+
+    let prisma_client = Arc::new(PrismaClient::_builder().build().await.unwrap());
+    let app_prisma_client = Arc::new(AppPrismaClient::new(
+        PrismaClient::_builder().build().await.unwrap(),
+    ));
+
+    let app = Router::new()
+        .fallback(crate::controllers::spa_static)
+        .nest("/api/", create_api_router())
+        .layer(Extension(prisma_client))
+        .layer(Extension(app_prisma_client))
+        .layer(Extension(pool));
+
+    axum::Server::bind(&bind.parse().unwrap())
         .serve(app.into_make_service())
         .await
-        .unwrap()
-}
-
-async fn spa_static_handler(uri: Uri) -> impl IntoResponse {
-    let path = uri.path().trim_start_matches('/');
-
-    if path.is_empty() || path == INDEX_HTML {
-        return index_html().await;
-    }
-
-    match Assets::get(path) {
-        Some(content) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-
-            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
-        }
-        None => {
-            if path.contains('.') {
-                return not_found().await;
-            }
-
-            index_html().await
-        }
-    }
-}
-
-async fn index_html() -> Response {
-    match Assets::get(INDEX_HTML) {
-        Some(content) => Html(content.data).into_response(),
-        None => not_found().await,
-    }
-}
-
-async fn not_found() -> Response {
-    (StatusCode::NOT_FOUND, "404").into_response()
+        .unwrap();
 }
